@@ -2,7 +2,7 @@
 
 Read-only Docker inventory and metrics agent for HomeLab.
 
-The agent runs on a Docker host, reads the local Docker socket, and pushes inventory/metrics back to HomeLab over HTTPS.
+The agent runs on a Docker host, reads the local Docker socket, and pushes inventory/metrics back to Kaya over HTTPS.
 
 ## Authentication
 
