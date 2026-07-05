@@ -1,24 +1,54 @@
+import base64
+import hashlib
+import io
 import json
 import os
+import re
 import socket
+import tarfile
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import docker
 import requests
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-HOMELAB_URL = os.getenv("HOMELAB_URL", "").rstrip("/")
-AGENT_TOKEN = os.getenv("HOMELAB_AGENT_TOKEN", "")
-AGENT_NAME = os.getenv("HOMELAB_AGENT_NAME") or socket.gethostname()
-POLL_SECONDS = max(10, int(os.getenv("HOMELAB_POLL_SECONDS", "30")))
-VERIFY_TLS = os.getenv("HOMELAB_VERIFY_TLS", "true").lower() not in {"0", "false", "no"}
+AGENT_VERSION = "0.2.0"
+AGENT_NAME_HEADER = "Kaya-Docker-Agent"
+BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"
+
+KAYA_URL = (os.getenv("KAYA_URL") or os.getenv("HOMELAB_URL") or "").rstrip("/")
+AGENT_TOKEN = os.getenv("KAYA_AGENT_TOKEN") or os.getenv("HOMELAB_AGENT_TOKEN") or ""
+AGENT_NAME = os.getenv("KAYA_AGENT_NAME") or os.getenv("HOMELAB_AGENT_NAME") or socket.gethostname()
+POLL_SECONDS = max(10, int(os.getenv("KAYA_POLL_SECONDS") or os.getenv("HOMELAB_POLL_SECONDS") or "30"))
+VERIFY_TLS = (os.getenv("KAYA_VERIFY_TLS") or os.getenv("HOMELAB_VERIFY_TLS") or "true").lower() not in {"0", "false", "no"}
 DOCKER_HOST = os.getenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def auth_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {AGENT_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": f"{AGENT_NAME_HEADER}/{AGENT_VERSION}",
+    }
+
+
+def api_url(path: str) -> str:
+    if not KAYA_URL:
+        raise RuntimeError("KAYA_URL is not set")
+    if not AGENT_TOKEN:
+        raise RuntimeError("KAYA_AGENT_TOKEN is not set")
+    return f"{KAYA_URL}{path}"
 
 
 def docker_cpu_percent(stats: dict[str, Any]) -> float | None:
@@ -221,7 +251,7 @@ def collect_payload() -> dict[str, Any]:
         "agent_name": AGENT_NAME,
         "collected_at": utc_now(),
         "platform": "docker-agent",
-        "version": version.get("Version"),
+        "version": f"Agent {AGENT_VERSION} / Docker {version.get('Version')}",
         "host": {
             "name": info.get("Name") or AGENT_NAME,
             "cpu_percent": sum(c.get("cpu_percent") or 0 for c in running),
@@ -230,6 +260,13 @@ def collect_payload() -> dict[str, Any]:
             "storage_used": None,
             "storage_total": None,
             "metadata": {
+                "agent_version": AGENT_VERSION,
+                "agent_capabilities": {
+                    "docker_backups": True,
+                    "backup_restore": True,
+                    "backup_storage_targets": ["local"],
+                    "backup_encryption": ["aes-256-gcm"],
+                },
                 "docker_root_dir": info.get("DockerRootDir"),
                 "operating_system": info.get("OperatingSystem"),
                 "kernel_version": info.get("KernelVersion"),
@@ -244,41 +281,370 @@ def collect_payload() -> dict[str, Any]:
 
 
 def post_payload(payload: dict[str, Any]) -> None:
-    if not HOMELAB_URL:
-        raise RuntimeError("HOMELAB_URL is not set")
-
-    if not AGENT_TOKEN:
-        raise RuntimeError("HOMELAB_AGENT_TOKEN is not set")
-
     response = requests.post(
-        f"{HOMELAB_URL}/infrastructure/vm-docker-manager/api/agent/checkin",
-        headers={
-            "Authorization": f"Bearer {AGENT_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": "HomeLab-Docker-Agent/0.1",
-        },
+        api_url("/infrastructure/vm-docker-manager/api/agent/checkin"),
+        headers=auth_headers(),
         data=json.dumps(payload),
         timeout=30,
         verify=VERIFY_TLS,
     )
 
     if response.status_code >= 400:
-        raise RuntimeError(f"HomeLab check-in failed: HTTP {response.status_code} {response.text[:500]}")
+        raise RuntimeError(f"Kaya check-in failed: HTTP {response.status_code} {response.text[:500]}")
+
+
+def fetch_backup_jobs() -> list[dict[str, Any]]:
+    response = requests.get(
+        api_url("/infrastructure/backup-manager/api/agent/jobs"),
+        headers=auth_headers(),
+        timeout=30,
+        verify=VERIFY_TLS,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Kaya backup job poll failed: HTTP {response.status_code} {response.text[:500]}")
+    payload = response.json()
+    jobs = payload.get("jobs") if isinstance(payload, dict) else []
+    return jobs if isinstance(jobs, list) else []
+
+
+def report_backup_job(job_id: int, status: str, **extra: Any) -> None:
+    payload = {"status": status}
+    payload.update({key: value for key, value in extra.items() if value is not None})
+    response = requests.post(
+        api_url(f"/infrastructure/backup-manager/api/agent/jobs/{job_id}/status"),
+        headers=auth_headers(),
+        data=json.dumps(payload),
+        timeout=30,
+        verify=VERIFY_TLS,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Kaya backup status update failed: HTTP {response.status_code} {response.text[:500]}")
+
+
+def derive_backup_key(raw_key: str) -> bytes:
+    if not raw_key:
+        raise RuntimeError("Backup job did not include an encryption key")
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"kaya-agent-backup-v1",
+        info=b"docker-backup-artifact",
+    ).derive(raw_key.encode("utf-8"))
+
+
+def encrypt_bytes(data: bytes, raw_key: str) -> bytes:
+    nonce = os.urandom(12)
+    encrypted = AESGCM(derive_backup_key(raw_key)).encrypt(nonce, data, BACKUP_MAGIC)
+    return BACKUP_MAGIC + nonce + encrypted
+
+
+def decrypt_bytes(data: bytes, raw_key: str) -> bytes:
+    if not data.startswith(BACKUP_MAGIC):
+        raise RuntimeError("Backup artifact is not a Kaya encrypted backup")
+    offset = len(BACKUP_MAGIC)
+    nonce = data[offset : offset + 12]
+    encrypted = data[offset + 12 :]
+    return AESGCM(derive_backup_key(raw_key)).decrypt(nonce, encrypted, BACKUP_MAGIC)
+
+
+def safe_name(value: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip(".-")
+    return clean[:120] or "container"
+
+
+def sha_name(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
+
+
+def policy_paths(policy: str | None) -> set[str]:
+    if not policy:
+        return set()
+    found: set[str] = set()
+    normalised = policy.replace("\n", ",").replace(";", ",")
+    for token in normalised.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            key, value = token.split("=", 1)
+            if key.strip().lower() not in {"path", "paths", "bind", "binds", "include", "includes"}:
+                continue
+            token = value.strip()
+        if token.startswith("/"):
+            found.add(token.rstrip("/") or "/")
+    return found
+
+
+def find_container(client: docker.DockerClient, job: dict[str, Any]):
+    external_id = str(job.get("external_id") or "").strip()
+    name = str(job.get("container") or "").strip()
+    for candidate in [external_id, name]:
+        if not candidate:
+            continue
+        try:
+            return client.containers.get(candidate)
+        except docker.errors.NotFound:
+            continue
+    raise RuntimeError(f"Container {name or external_id or 'unknown'} was not found on this Docker host")
+
+
+def backup_paths_for_container(container, policy: str | None) -> tuple[list[dict[str, Any]], list[str]]:
+    attrs = safe_attrs(container)
+    mounts = attrs.get("Mounts") or []
+    requested_bind_paths = policy_paths(policy)
+    paths: list[dict[str, Any]] = []
+    logs: list[str] = []
+    seen: set[str] = set()
+
+    for mount in mounts:
+        destination = str(mount.get("Destination") or "").rstrip("/")
+        if not destination or destination in seen:
+            continue
+        mount_type = mount.get("Type")
+        if mount_type == "volume":
+            paths.append(
+                {
+                    "path": destination,
+                    "kind": "volume",
+                    "name": mount.get("Name"),
+                    "source": mount.get("Source"),
+                }
+            )
+            seen.add(destination)
+        elif mount_type == "bind" and destination in requested_bind_paths:
+            paths.append(
+                {
+                    "path": destination,
+                    "kind": "bind",
+                    "source": mount.get("Source"),
+                }
+            )
+            seen.add(destination)
+
+    skipped_binds = [
+        str(mount.get("Destination"))
+        for mount in mounts
+        if mount.get("Type") == "bind" and str(mount.get("Destination") or "").rstrip("/") not in seen
+    ]
+    if skipped_binds:
+        logs.append(
+            "Skipped bind mounts not explicitly listed in the backup policy: "
+            + ", ".join(sorted(path for path in skipped_binds if path))
+        )
+
+    return paths, logs
+
+
+def add_bytes_to_tar(bundle: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mtime = int(time.time())
+    bundle.addfile(info, io.BytesIO(data))
+
+
+def read_container_archive(container, path: str) -> tuple[bytes, dict[str, Any]]:
+    chunks, stat = container.get_archive(path)
+    data = b"".join(chunks)
+    return data, stat or {}
+
+
+def resolve_storage_directory(target: dict[str, Any]) -> Path:
+    storage_type = str(target.get("type") or "local").lower()
+    storage_path = Path(str(target.get("path") or "/mnt/backups"))
+    if storage_type != "local" and not storage_path.exists():
+        raise RuntimeError(
+            f"Agent-side backups currently require {storage_type.upper()} storage to be mounted at {storage_path}"
+        )
+    storage_path.mkdir(parents=True, exist_ok=True)
+    if not storage_path.is_dir():
+        raise RuntimeError(f"Backup target {storage_path} is not a directory")
+    return storage_path
+
+
+def create_backup_bundle(job: dict[str, Any], container) -> tuple[bytes, dict[str, Any], str]:
+    attrs = safe_attrs(container)
+    config = attrs.get("Config") or {}
+    paths, log_lines = backup_paths_for_container(container, job.get("policy"))
+    manifest = {
+        "format": "kaya-docker-backup-v1",
+        "created_at": utc_now(),
+        "agent_version": AGENT_VERSION,
+        "container": {
+            "id": container.id,
+            "name": container.name,
+            "image": config.get("Image"),
+            "labels": config.get("Labels") or {},
+            "attrs": attrs,
+        },
+        "paths": [],
+    }
+
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:gz") as bundle:
+        for item in paths:
+            try:
+                archive_bytes, stat = read_container_archive(container, item["path"])
+            except Exception as exc:
+                raise RuntimeError(f"Could not read {item['path']} from {container.name}: {exc}") from exc
+
+            archive_name = f"archives/{sha_name(item['path'])}.tar"
+            add_bytes_to_tar(bundle, archive_name, archive_bytes)
+            manifest["paths"].append(
+                {
+                    **item,
+                    "archive": archive_name,
+                    "stat": stat,
+                    "sha256": hashlib.sha256(archive_bytes).hexdigest(),
+                    "size_bytes": len(archive_bytes),
+                }
+            )
+
+        add_bytes_to_tar(bundle, "manifest.json", json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"))
+
+    if not paths:
+        log_lines.append("No Docker named volumes or opted-in bind mounts were found; saved container metadata only.")
+    return stream.getvalue(), manifest, "\n".join(log_lines)
+
+
+def run_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[str, Any]:
+    container = find_container(client, job)
+    target_dir = resolve_storage_directory(job.get("target") or {})
+    bundle, manifest, log = create_backup_bundle(job, container)
+    encrypted = encrypt_bytes(bundle, (job.get("encryption") or {}).get("key") or "")
+
+    artifact_dir = target_dir / "docker" / safe_name(container.name)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-job-{job['id']}.kaya-backup"
+    artifact.write_bytes(encrypted)
+
+    return {
+        "artifact_path": str(artifact),
+        "size_bytes": artifact.stat().st_size,
+        "log": log,
+        "metadata": {
+            "agent_version": AGENT_VERSION,
+            "container": container.name,
+            "format": manifest["format"],
+            "path_count": len(manifest["paths"]),
+            "paths": [item["path"] for item in manifest["paths"]],
+        },
+    }
+
+
+def safe_extract_tar(tar: tarfile.TarFile, target: Path) -> None:
+    target = target.resolve()
+    for member in tar.getmembers():
+        destination = (target / member.name).resolve()
+        try:
+            destination.relative_to(target)
+        except ValueError:
+            raise RuntimeError(f"Refusing unsafe backup member path: {member.name}")
+        tar.extract(member, target)
+
+
+def decrypt_bundle_to_temp(artifact: Path, raw_key: str, temp_dir: Path) -> Path:
+    if not artifact.exists():
+        raise RuntimeError(f"Backup artifact {artifact} does not exist from inside the agent")
+    bundle_bytes = decrypt_bytes(artifact.read_bytes(), raw_key)
+    bundle_path = temp_dir / "bundle.tar.gz"
+    bundle_path.write_bytes(bundle_bytes)
+    extract_dir = temp_dir / "bundle"
+    extract_dir.mkdir()
+    with tarfile.open(bundle_path, "r:gz") as tar:
+        safe_extract_tar(tar, extract_dir)
+    return extract_dir
+
+
+def load_manifest(bundle_dir: Path) -> dict[str, Any]:
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise RuntimeError("Backup artifact is missing manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != "kaya-docker-backup-v1":
+        raise RuntimeError("Backup artifact format is not supported by this agent")
+    return manifest
+
+
+def run_restore_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[str, Any]:
+    source_artifact = str(job.get("source_artifact") or "").strip()
+    if not source_artifact:
+        raise RuntimeError("Restore job did not include a source artifact")
+
+    container = find_container(client, job)
+    with tempfile.TemporaryDirectory(prefix="kaya-restore-") as temp:
+        bundle_dir = decrypt_bundle_to_temp(
+            Path(source_artifact),
+            (job.get("encryption") or {}).get("key") or "",
+            Path(temp),
+        )
+        manifest = load_manifest(bundle_dir)
+        restored_paths = []
+        for item in manifest.get("paths") or []:
+            path = str(item.get("path") or "")
+            archive_name = str(item.get("archive") or "")
+            if not path.startswith("/") or not archive_name.startswith("archives/"):
+                raise RuntimeError(f"Backup manifest contains an unsafe restore path: {path}")
+            archive_path = bundle_dir / archive_name
+            archive_bytes = archive_path.read_bytes()
+            expected_sha = item.get("sha256")
+            if expected_sha and hashlib.sha256(archive_bytes).hexdigest() != expected_sha:
+                raise RuntimeError(f"Archive checksum failed for {path}")
+            if not container.put_archive("/", archive_bytes):
+                raise RuntimeError(f"Docker refused restore archive for {path}")
+            restored_paths.append(path)
+
+    return {
+        "artifact_path": source_artifact,
+        "size_bytes": int(job.get("source_size_bytes") or 0) or None,
+        "log": "Restored paths: " + (", ".join(restored_paths) if restored_paths else "metadata only"),
+        "metadata": {
+            "agent_version": AGENT_VERSION,
+            "container": container.name,
+            "restored_paths": restored_paths,
+        },
+    }
+
+
+def process_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> None:
+    job_id = int(job["id"])
+    operation = str(job.get("operation") or "").lower()
+    report_backup_job(job_id, "running", log=f"Agent {AGENT_VERSION} started {operation} job")
+    try:
+        if operation == "backup":
+            result = run_backup_job(client, job)
+        elif operation == "restore":
+            result = run_restore_job(client, job)
+        else:
+            raise RuntimeError(f"Unsupported backup operation: {operation}")
+        report_backup_job(job_id, "successful", **result)
+        print(f"{utc_now()} {operation} job #{job_id} successful")
+    except Exception as exc:
+        message = str(exc)
+        report_backup_job(job_id, "failed", error=message, log=message)
+        print(f"{utc_now()} {operation} job #{job_id} failed: {message}")
+
+
+def process_backup_jobs(client: docker.DockerClient) -> None:
+    jobs = fetch_backup_jobs()
+    for job in jobs:
+        process_backup_job(client, job)
 
 
 def main() -> None:
-    print(f"HomeLab Docker Agent starting as {AGENT_NAME}")
-    print(f"HomeLab URL: {HOMELAB_URL}")
+    print(f"Kaya Docker Agent {AGENT_VERSION} starting as {AGENT_NAME}")
+    print(f"Kaya URL: {KAYA_URL}")
     print(f"Docker host: {DOCKER_HOST}")
     print(f"Poll interval: {POLL_SECONDS}s")
 
     while True:
         try:
+            client = docker.DockerClient(base_url=DOCKER_HOST)
             payload = collect_payload()
             post_payload(payload)
             print(f"{utc_now()} check-in successful: {len(payload['workloads'])} workloads")
+            process_backup_jobs(client)
         except Exception as exc:
-            print(f"{utc_now()} check-in failed: {exc}")
+            print(f"{utc_now()} agent loop failed: {exc}")
 
         time.sleep(POLL_SECONDS)
 

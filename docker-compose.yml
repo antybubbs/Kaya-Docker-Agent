@@ -1,16 +1,19 @@
 services:
-  homelab-agent:
-    image: ghcr.io/antybubbs/homelab-docker-agent:latest
-    container_name: homelab-agent
+  kaya-agent:
+    image: ghcr.io/antybubbs/kaya-docker-agent:latest
+    container_name: kaya-docker-agent
     restart: unless-stopped
     environment:
-      HOMELAB_URL: "https://your-homelab-url"
-      # Use the original token shown once by HomeLab when the agent is created
-      # or regenerated. Do not use the SHA-256 hash stored by HomeLab.
-      HOMELAB_AGENT_TOKEN: "replace-with-original-generated-token"
-      HOMELAB_AGENT_NAME: "docker-host-01"
-      HOMELAB_POLL_SECONDS: "30"
-      HOMELAB_VERIFY_TLS: "true"
+      KAYA_URL: "https://your-kaya-url"
+      # Use the original token shown once by Kaya when the agent is created
+      # or regenerated. Do not use the SHA-256 hash stored by Kaya.
+      KAYA_AGENT_TOKEN: "replace-with-original-generated-token"
+      KAYA_AGENT_NAME: "docker-host-01"
+      KAYA_POLL_SECONDS: "30"
+      KAYA_VERIFY_TLS: "true"
       DOCKER_HOST: "unix:///var/run/docker.sock"
     volumes:
+      # The Docker socket gives the agent Docker control on this host.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Mount the same backup path configured in Kaya Site Administration.
+      - /mnt/backups:/mnt/backups
