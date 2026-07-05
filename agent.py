@@ -14,12 +14,13 @@ from typing import Any
 
 import docker
 import requests
+import smbclient
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.2.1"
 AGENT_NAME_HEADER = "Kaya-Docker-Agent"
 BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"
 
@@ -264,7 +265,7 @@ def collect_payload() -> dict[str, Any]:
                 "agent_capabilities": {
                     "docker_backups": True,
                     "backup_restore": True,
-                    "backup_storage_targets": ["local"],
+                    "backup_storage_targets": ["local", "smb"],
                     "backup_encryption": ["aes-256-gcm"],
                 },
                 "docker_root_dir": info.get("DockerRootDir"),
@@ -448,17 +449,96 @@ def read_container_archive(container, path: str) -> tuple[bytes, dict[str, Any]]
     return data, stat or {}
 
 
-def resolve_storage_directory(target: dict[str, Any]) -> Path:
+def smb_unc_path(target: dict[str, Any], *children: str) -> str:
+    host = str(target.get("remote_host") or "").strip().strip("\\/")
+    share_path = str(target.get("remote_share") or "").strip().strip("\\/")
+    if not host:
+        raise RuntimeError("SMB backup target is missing remote_host")
+    if not share_path:
+        raise RuntimeError("SMB backup target is missing remote_share")
+    parts = [part for part in share_path.replace("\\", "/").split("/") if part]
+    share = parts[0]
+    path_parts = parts[1:]
+    for child in children:
+        path_parts.extend(part for part in str(child).replace("\\", "/").split("/") if part)
+    suffix = ("\\" + "\\".join(path_parts)) if path_parts else ""
+    return f"\\\\{host}\\{share}{suffix}"
+
+
+def smb_register(target: dict[str, Any]) -> str:
+    host = str(target.get("remote_host") or "").strip()
+    username = str(target.get("remote_username") or "").strip() or None
+    password = target.get("remote_password") or None
+    smbclient.register_session(host, username=username, password=password)
+    return host
+
+
+def smb_makedirs(target: dict[str, Any], *children: str) -> None:
+    host = smb_register(target)
+    try:
+        current_children: list[str] = []
+        for child in children:
+            for part in str(child).replace("\\", "/").split("/"):
+                if not part:
+                    continue
+                current_children.append(part)
+                path = smb_unc_path(target, *current_children)
+                try:
+                    smbclient.mkdir(path)
+                except Exception:
+                    pass
+    finally:
+        try:
+            smbclient.delete_session(host)
+        except Exception:
+            pass
+
+
+def write_backup_artifact(target: dict[str, Any], container_name: str, filename: str, data: bytes) -> tuple[str, int]:
     storage_type = str(target.get("type") or "local").lower()
+    container_dir = safe_name(container_name)
+    if storage_type == "smb":
+        smb_makedirs(target, "docker", container_dir)
+        host = smb_register(target)
+        artifact = smb_unc_path(target, "docker", container_dir, filename)
+        try:
+            with smbclient.open_file(artifact, mode="wb") as handle:
+                handle.write(data)
+            size = smbclient.stat(artifact).st_size
+        finally:
+            try:
+                smbclient.delete_session(host)
+            except Exception:
+                pass
+        return artifact, int(size)
+
+    if storage_type != "local":
+        raise RuntimeError(f"Agent-side backups do not yet support {storage_type.upper()} storage directly")
+
     storage_path = Path(str(target.get("path") or "/mnt/backups"))
-    if storage_type != "local" and not storage_path.exists():
-        raise RuntimeError(
-            f"Agent-side backups currently require {storage_type.upper()} storage to be mounted at {storage_path}"
-        )
     storage_path.mkdir(parents=True, exist_ok=True)
     if not storage_path.is_dir():
         raise RuntimeError(f"Backup target {storage_path} is not a directory")
-    return storage_path
+    artifact_dir = storage_path / "docker" / container_dir
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / filename
+    artifact.write_bytes(data)
+    return str(artifact), artifact.stat().st_size
+
+
+def read_backup_artifact(target: dict[str, Any], artifact_path: str) -> bytes:
+    storage_type = str(target.get("type") or "local").lower()
+    if artifact_path.startswith("\\\\") or storage_type == "smb":
+        host = smb_register(target)
+        try:
+            with smbclient.open_file(artifact_path, mode="rb") as handle:
+                return handle.read()
+        finally:
+            try:
+                smbclient.delete_session(host)
+            except Exception:
+                pass
+    return Path(artifact_path).read_bytes()
 
 
 def create_backup_bundle(job: dict[str, Any], container) -> tuple[bytes, dict[str, Any], str]:
@@ -508,18 +588,14 @@ def create_backup_bundle(job: dict[str, Any], container) -> tuple[bytes, dict[st
 
 def run_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[str, Any]:
     container = find_container(client, job)
-    target_dir = resolve_storage_directory(job.get("target") or {})
     bundle, manifest, log = create_backup_bundle(job, container)
     encrypted = encrypt_bytes(bundle, (job.get("encryption") or {}).get("key") or "")
-
-    artifact_dir = target_dir / "docker" / safe_name(container.name)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact = artifact_dir / f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-job-{job['id']}.kaya-backup"
-    artifact.write_bytes(encrypted)
+    filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-job-{job['id']}.kaya-backup"
+    artifact_path, size_bytes = write_backup_artifact(job.get("target") or {}, container.name, filename, encrypted)
 
     return {
-        "artifact_path": str(artifact),
-        "size_bytes": artifact.stat().st_size,
+        "artifact_path": artifact_path,
+        "size_bytes": size_bytes,
         "log": log,
         "metadata": {
             "agent_version": AGENT_VERSION,
@@ -542,10 +618,8 @@ def safe_extract_tar(tar: tarfile.TarFile, target: Path) -> None:
         tar.extract(member, target)
 
 
-def decrypt_bundle_to_temp(artifact: Path, raw_key: str, temp_dir: Path) -> Path:
-    if not artifact.exists():
-        raise RuntimeError(f"Backup artifact {artifact} does not exist from inside the agent")
-    bundle_bytes = decrypt_bytes(artifact.read_bytes(), raw_key)
+def decrypt_bundle_to_temp(target: dict[str, Any], artifact_path: str, raw_key: str, temp_dir: Path) -> Path:
+    bundle_bytes = decrypt_bytes(read_backup_artifact(target, artifact_path), raw_key)
     bundle_path = temp_dir / "bundle.tar.gz"
     bundle_path.write_bytes(bundle_bytes)
     extract_dir = temp_dir / "bundle"
@@ -573,7 +647,8 @@ def run_restore_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[st
     container = find_container(client, job)
     with tempfile.TemporaryDirectory(prefix="kaya-restore-") as temp:
         bundle_dir = decrypt_bundle_to_temp(
-            Path(source_artifact),
+            job.get("target") or {},
+            source_artifact,
             (job.get("encryption") or {}).get("key") or "",
             Path(temp),
         )

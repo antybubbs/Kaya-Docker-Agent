@@ -15,5 +15,6 @@ services:
     volumes:
       # The Docker socket gives the agent Docker control on this host.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Mount the same backup path configured in Kaya Site Administration.
+      # Only needed when Kaya backup storage type is Local path.
+      # SMB storage is reached directly using the settings saved in Kaya.
       - /mnt/backups:/mnt/backups

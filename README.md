@@ -8,7 +8,7 @@ The agent runs on a Docker host, reads the local Docker socket, pushes inventory
 
 Kaya queues Docker backup and restore jobs. The agent polls Kaya, runs the job on the Docker host, encrypts backup artifacts with AES-256-GCM, writes them to the configured storage path, and reports status back to Kaya.
 
-The first backup runner supports local or mounted storage paths, for example `/mnt/backups`. If you use SMB, NFS, SFTP or another remote target, mount it on the Docker host and expose the same path to the agent container.
+The backup runner supports local paths and SMB shares directly. For local storage, mount the backup path into the agent container. For SMB storage, configure the host, share/path, username and password in Kaya; no Docker-host mount is required.
 
 By default the agent backs up:
 
