@@ -24,7 +24,7 @@ AGENT_PACKAGE_NAME = "kaya-docker-agent"
 try:   
     AGENT_VERSION = version(AGENT_PACKAGE_NAME)
 except PackageNotFoundError:
-    AGENT_VERSION = os.getenv("KAYA_AGENT_VERSION", "0.1.1")
+    AGENT_VERSION = "unknown" 
 
 AGENT_NAME_HEADER = "Kaya-Docker-Agent"
 BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"
