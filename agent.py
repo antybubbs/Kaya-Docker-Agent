@@ -9,6 +9,7 @@ import tarfile
 import tempfile
 import time
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,12 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+AGENT_PACKAGE_NAME = "kaya-docker-agent"
+try:   
+    AGENT_VERSION = version(AGENT_PACKAGE_NAME)
+except PackageNotFoundError:
+    AGENT_VERSION = os.getenv("KAYA_AGENT_VERSION", "0.1.1")
 
-AGENT_VERSION = "0.2.1"
 AGENT_NAME_HEADER = "Kaya-Docker-Agent"
 BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"
 
