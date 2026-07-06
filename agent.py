@@ -21,10 +21,21 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 AGENT_PACKAGE_NAME = "kaya-docker-agent"
-try:   
-    AGENT_VERSION = version(AGENT_PACKAGE_NAME)
-except PackageNotFoundError:
-    AGENT_VERSION = "unknown" 
+
+
+def resolve_agent_version() -> str:
+    # Prefer explicit version injected at image build time.
+    env_version = os.getenv("KAYA_AGENT_VERSION") or os.getenv("HOMELAB_AGENT_VERSION")
+    if env_version:
+        return env_version
+
+    try:
+        return version(AGENT_PACKAGE_NAME)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+AGENT_VERSION = resolve_agent_version()
 
 AGENT_NAME_HEADER = "Kaya-Docker-Agent"
 BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"

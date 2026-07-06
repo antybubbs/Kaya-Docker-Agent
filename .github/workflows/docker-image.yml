@@ -29,7 +29,8 @@ jobs:
         with:
           images: ghcr.io/antybubbs/kaya-docker-agent
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}},priority=50
             type=ref,event=tag
             type=semver,pattern={{version}}
 
@@ -37,5 +38,7 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            AGENT_VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
