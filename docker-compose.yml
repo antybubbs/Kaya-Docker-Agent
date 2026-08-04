@@ -5,9 +5,10 @@ services:
     restart: unless-stopped
     environment:
       KAYA_URL: "https://your-kaya-url"
-      # Use the original token shown once by Kaya when the agent is created
-      # or regenerated. Do not use the SHA-256 hash stored by Kaya.
-      KAYA_AGENT_TOKEN: "replace-with-original-generated-token"
+      # First start only: use the 15-minute, host-bound bootstrap shown by Kaya.
+      # Remove this variable immediately after successful enrollment and restart.
+      KAYA_AGENT_BOOTSTRAP_TOKEN: "replace-with-one-time-bootstrap"
+      KAYA_AGENT_STATE_DIR: "/var/lib/kaya-agent"
       KAYA_AGENT_NAME: "docker-host-01"
       KAYA_POLL_SECONDS: "30"
       KAYA_VERIFY_TLS: "true"
@@ -15,6 +16,11 @@ services:
     volumes:
       # The Docker socket gives the agent Docker control on this host.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Holds the agent-generated signing/encryption private keys. Back it up securely.
+      - kaya-agent-state:/var/lib/kaya-agent
       # Only needed when Kaya backup storage type is Local path.
       # SMB storage is reached directly using the settings saved in Kaya.
       - /mnt/backups:/mnt/backups
+
+volumes:
+  kaya-agent-state:

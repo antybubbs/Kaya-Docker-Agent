@@ -26,21 +26,21 @@ Restore jobs restore backed-up paths into the existing target container. The fir
 
 ## Authentication
 
-Kaya stores Docker agent tokens as SHA-256 hashes. When
-creating or regenerating an agent token, copy the original plaintext token shown
-by Kaya and set it as `KAYA_AGENT_TOKEN`. The plaintext token is shown only
-once and cannot be recovered from the stored hash.
+Protocol v2 uses separate agent-generated Ed25519 signing and X25519 encryption
+keys. Kaya never receives either private key. An administrator provisions Kaya's
+dispatch-signing key once, then issues a host-bound bootstrap that expires after
+15 minutes and can be used only once.
 
-The agent sends that original token to the check-in endpoint as:
+Set `KAYA_AGENT_BOOTSTRAP_TOKEN` for the first start. After the successful
+enrollment, remove that variable and restart the container. Keep the persistent
+`KAYA_AGENT_STATE_DIR` volume: it contains the agent identity and private keys,
+is created with restrictive permissions, and must not be shared between hosts.
 
-```http
-Authorization: Bearer <token>
-```
-
-Do not configure the agent with the SHA-256 hash.
-
-`HOMELAB_*` environment variables are still accepted for older installs, but new installs should use `KAYA_*`.
+Every subsequent API call is signed with a timestamp and unique request ID.
+Backup offers contain no credentials. Credentials, encryption material, and the
+short-lived dispatch grant are returned only after an atomic claim, inside a
+server-signed X25519/HKDF/AES-GCM envelope.
 
 ## Security notes
 
-Access to `/var/run/docker.sock` effectively grants Docker control on the host. Run the agent only on Docker hosts you trust, protect the agent token, and expose Kaya over HTTPS.
+Access to `/var/run/docker.sock` effectively grants Docker control on the host. Run the agent only on Docker hosts you trust, protect and back up the protocol-v2 state volume, remove the bootstrap after enrollment, and expose Kaya over verified HTTPS.
