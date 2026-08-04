@@ -1,0 +1,14 @@
+{
+  "agent_ed25519_private_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "agent_ed25519_public": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "method": "post",
+  "path": "/api/agent/v2/backup/dispatches/disp_test_001/claim",
+  "raw_query": "tag=z&empty=&tag=%C3%A9&space=a%20b",
+  "agent_id": "agt_test_01",
+  "key_id": "ask_test_01",
+  "request_id": "018f3c2a-7b4d-4e5f-8a91-0123456789ab",
+  "timestamp": 1785861000,
+  "body_base64": "eyJjbGFpbV9pZCI6IjAxOGYzYzJhLTdiNGQtNGU1Zi04YTkxLTAxMjM0NTY3ODlhYiIsIm5vdGUiOiJjYWbDqSJ9",
+  "canonical_request": "KAYA-AGENT-V2\nPOST\n/api/agent/v2/backup/dispatches/disp_test_001/claim\nempty=&space=a%20b&tag=%C3%A9&tag=z\nagt_test_01\nask_test_01\n018f3c2a-7b4d-4e5f-8a91-0123456789ab\n1785861000\n8a5237249eeba99c832e2215cf8462f78bf2bde41f8e99894546d94db7073fc7",
+  "signature": "QfyJfAJeEsHIJe9NupZjPwO4ZuXSYPPhwXoYBOhYfudi7Du1RVrz0g8hIfiO8_Ql19ucFTaoMoxU1gUF8vJgCQ"
+}

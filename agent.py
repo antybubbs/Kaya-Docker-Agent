@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import io
 import json
@@ -8,17 +7,18 @@ import socket
 import tarfile
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import docker
-import requests
 import smbclient
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from protocol_v2 import ProtocolV2Client
 
 AGENT_PACKAGE_NAME = "kaya-docker-agent"
 
@@ -41,7 +41,8 @@ AGENT_NAME_HEADER = "Kaya-Docker-Agent"
 BACKUP_MAGIC = b"KAYA-BACKUP-v1\n"
 
 KAYA_URL = (os.getenv("KAYA_URL") or os.getenv("HOMELAB_URL") or "").rstrip("/")
-AGENT_TOKEN = os.getenv("KAYA_AGENT_TOKEN") or os.getenv("HOMELAB_AGENT_TOKEN") or ""
+AGENT_BOOTSTRAP_TOKEN = os.getenv("KAYA_AGENT_BOOTSTRAP_TOKEN") or ""
+AGENT_STATE_DIR = Path(os.getenv("KAYA_AGENT_STATE_DIR") or "/var/lib/kaya-agent")
 AGENT_NAME = os.getenv("KAYA_AGENT_NAME") or os.getenv("HOMELAB_AGENT_NAME") or socket.gethostname()
 POLL_SECONDS = max(10, int(os.getenv("KAYA_POLL_SECONDS") or os.getenv("HOMELAB_POLL_SECONDS") or "30"))
 VERIFY_TLS = (os.getenv("KAYA_VERIFY_TLS") or os.getenv("HOMELAB_VERIFY_TLS") or "true").lower() not in {"0", "false", "no"}
@@ -52,20 +53,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def auth_headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {AGENT_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": f"{AGENT_NAME_HEADER}/{AGENT_VERSION}",
-    }
+_protocol_client: ProtocolV2Client | None = None
 
 
-def api_url(path: str) -> str:
-    if not KAYA_URL:
-        raise RuntimeError("KAYA_URL is not set")
-    if not AGENT_TOKEN:
-        raise RuntimeError("KAYA_AGENT_TOKEN is not set")
-    return f"{KAYA_URL}{path}"
+def protocol_client() -> ProtocolV2Client:
+    global _protocol_client
+    if _protocol_client is None:
+        if not KAYA_URL:
+            raise RuntimeError("KAYA_URL is not set")
+        _protocol_client = ProtocolV2Client(KAYA_URL, AGENT_STATE_DIR, VERIFY_TLS, AGENT_BOOTSTRAP_TOKEN, f"{AGENT_NAME_HEADER}/{AGENT_VERSION}")
+    return _protocol_client
 
 
 def docker_cpu_percent(stats: dict[str, Any]) -> float | None:
@@ -278,7 +275,9 @@ def collect_payload() -> dict[str, Any]:
             "storage_total": None,
             "metadata": {
                 "agent_version": AGENT_VERSION,
+                "agent_protocol_version": 2,
                 "agent_capabilities": {
+                    "machine_authentication": "protocol-v2",
                     "docker_backups": True,
                     "backup_restore": True,
                     "backup_storage_targets": ["local", "smb"],
@@ -298,42 +297,38 @@ def collect_payload() -> dict[str, Any]:
 
 
 def post_payload(payload: dict[str, Any]) -> None:
-    response = requests.post(
-        api_url("/infrastructure/vm-docker-manager/api/agent/checkin"),
-        headers=auth_headers(),
-        data=json.dumps(payload),
-        timeout=30,
-        verify=VERIFY_TLS,
-    )
+    response = protocol_client().request("POST", "/api/agent/v2/checkin", payload)
 
     if response.status_code >= 400:
         raise RuntimeError(f"Kaya check-in failed: HTTP {response.status_code} {response.text[:500]}")
 
 
 def fetch_backup_jobs() -> list[dict[str, Any]]:
-    response = requests.get(
-        api_url("/infrastructure/backup-manager/api/agent/jobs"),
-        headers=auth_headers(),
-        timeout=30,
-        verify=VERIFY_TLS,
-    )
+    response = protocol_client().request("GET", "/api/agent/v2/backup/offers")
     if response.status_code >= 400:
         raise RuntimeError(f"Kaya backup job poll failed: HTTP {response.status_code} {response.text[:500]}")
     payload = response.json()
-    jobs = payload.get("jobs") if isinstance(payload, dict) else []
-    return jobs if isinstance(jobs, list) else []
+    offers = payload.get("offers") if isinstance(payload, dict) else []
+    jobs = []
+    for offer in offers if isinstance(offers, list) else []:
+        dispatch_id, claim_id = offer["dispatch_id"], str(uuid.uuid4())
+        claimed = protocol_client().request("POST", f"/api/agent/v2/backup/dispatches/{dispatch_id}/claim", {"claim_id": claim_id})
+        if claimed.status_code >= 400:
+            raise RuntimeError(f"Kaya backup claim failed: HTTP {claimed.status_code}")
+        secret = protocol_client().open_envelope(claimed.json(), dispatch_id, claim_id)
+        manifest = secret["manifest"]
+        restore = secret.get("restore") if isinstance(secret.get("restore"), dict) else {}
+        jobs.append({"id": int(manifest["job_id"]), "dispatch_id": dispatch_id, "dispatch_grant": secret["dispatch_grant"], "operation": manifest["operation"], "external_id": manifest["workload_ref"], "policy": manifest["policy"], "target": secret["target"], "encryption": {"enabled": True, "mode": secret["encryption"]["mode"], "key": secret["encryption"]["data_key"]}, "artifact_name": secret.get("artifact_name"), "source_artifact": restore.get("source_artifact"), "source_size_bytes": restore.get("source_size_bytes")})
+    return jobs
 
 
-def report_backup_job(job_id: int, status: str, **extra: Any) -> None:
-    payload = {"status": status}
-    payload.update({key: value for key, value in extra.items() if value is not None})
-    response = requests.post(
-        api_url(f"/infrastructure/backup-manager/api/agent/jobs/{job_id}/status"),
-        headers=auth_headers(),
-        data=json.dumps(payload),
-        timeout=30,
-        verify=VERIFY_TLS,
-    )
+def report_backup_job(job: dict[str, Any], status: str, **extra: Any) -> None:
+    payload = {"state": status, "dispatch_grant": job["dispatch_grant"]}
+    if extra.get("size_bytes") is not None:
+        payload["bytes_processed"] = extra["size_bytes"]
+    if status == "failed":
+        payload["result_code"] = "agent_execution_failed"
+    response = protocol_client().request("POST", f"/api/agent/v2/backup/dispatches/{job['dispatch_id']}/status", payload)
     if response.status_code >= 400:
         raise RuntimeError(f"Kaya backup status update failed: HTTP {response.status_code} {response.text[:500]}")
 
@@ -606,7 +601,7 @@ def run_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[str
     container = find_container(client, job)
     bundle, manifest, log = create_backup_bundle(job, container)
     encrypted = encrypt_bytes(bundle, (job.get("encryption") or {}).get("key") or "")
-    filename = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-job-{job['id']}.kaya-backup"
+    filename = str(job.get("artifact_name") or f"job-{job['id']}.kaya-backup")
     artifact_path, size_bytes = write_backup_artifact(job.get("target") or {}, container.name, filename, encrypted)
 
     return {
@@ -699,7 +694,7 @@ def run_restore_job(client: docker.DockerClient, job: dict[str, Any]) -> dict[st
 def process_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> None:
     job_id = int(job["id"])
     operation = str(job.get("operation") or "").lower()
-    report_backup_job(job_id, "running", log=f"Agent {AGENT_VERSION} started {operation} job")
+    report_backup_job(job, "running", log=f"Agent {AGENT_VERSION} started {operation} job")
     try:
         if operation == "backup":
             result = run_backup_job(client, job)
@@ -707,11 +702,11 @@ def process_backup_job(client: docker.DockerClient, job: dict[str, Any]) -> None
             result = run_restore_job(client, job)
         else:
             raise RuntimeError(f"Unsupported backup operation: {operation}")
-        report_backup_job(job_id, "successful", **result)
+        report_backup_job(job, "successful", **result)
         print(f"{utc_now()} {operation} job #{job_id} successful")
     except Exception as exc:
         message = str(exc)
-        report_backup_job(job_id, "failed", error=message, log=message)
+        report_backup_job(job, "failed", error=message, log=message)
         print(f"{utc_now()} {operation} job #{job_id} failed: {message}")
 
 
