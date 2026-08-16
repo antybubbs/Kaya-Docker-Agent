@@ -90,6 +90,17 @@ def docker_cpu_percent(stats: dict[str, Any]) -> float | None:
     return None
 
 
+def docker_uptime_seconds(started_at: str | None) -> int | None:
+    if not started_at or str(started_at).startswith("0001-01-01"):
+        return None
+    try:
+        started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        now = datetime.now(started.tzinfo) if started.tzinfo else datetime.utcnow()
+        return max(0, int((now - started).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
 def safe_attrs(obj: Any) -> dict[str, Any]:
     try:
         return obj.attrs or {}
@@ -118,6 +129,12 @@ def collect_containers(client: docker.DockerClient) -> list[dict[str, Any]]:
         memory_stats = stats.get("memory_stats") or {}
         memory_used = memory_stats.get("usage")
         memory_total = memory_stats.get("limit")
+        storage_used = attrs.get("SizeRw")
+        if storage_used is None:
+            try:
+                storage_used = client.api.inspect_container(container.id, size=True).get("SizeRw")
+            except docker.errors.APIError:
+                storage_used = None
 
         containers.append(
             {
@@ -129,9 +146,13 @@ def collect_containers(client: docker.DockerClient) -> list[dict[str, Any]]:
                 "cpu_percent": docker_cpu_percent(stats),
                 "memory_used": memory_used,
                 "memory_total": memory_total,
-                "storage_used": attrs.get("SizeRw"),
+                "storage_used": storage_used,
                 "storage_total": None,
-                "uptime_seconds": None,
+                "uptime_seconds": (
+                    docker_uptime_seconds(state.get("StartedAt"))
+                    if state.get("Running")
+                    else None
+                ),
                 "tags": labels.get("com.docker.compose.project"),
                 "metadata": {
                     "short_id": container.short_id,
