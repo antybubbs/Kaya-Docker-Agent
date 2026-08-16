@@ -101,6 +101,17 @@ def docker_uptime_seconds(started_at: str | None) -> int | None:
         return None
 
 
+def docker_storage_used(client: docker.DockerClient, container: Any, attrs: dict[str, Any]) -> int | None:
+    storage_used = attrs.get("SizeRw")
+    if storage_used is not None:
+        return storage_used
+    try:
+        url = client.api._url("/containers/{0}/json", container.id)
+        response = client.api._get(url, params={"size": "1"})
+        payload = response if isinstance(response, dict) else response.json()
+        return payload.get("SizeRw") if isinstance(payload, dict) else None
+    except (docker.errors.DockerException, AttributeError, TypeError, ValueError):
+        return None
 def safe_attrs(obj: Any) -> dict[str, Any]:
     try:
         return obj.attrs or {}
@@ -129,12 +140,7 @@ def collect_containers(client: docker.DockerClient) -> list[dict[str, Any]]:
         memory_stats = stats.get("memory_stats") or {}
         memory_used = memory_stats.get("usage")
         memory_total = memory_stats.get("limit")
-        storage_used = attrs.get("SizeRw")
-        if storage_used is None:
-            try:
-                storage_used = client.api.inspect_container(container.id, size=True).get("SizeRw")
-            except docker.errors.APIError:
-                storage_used = None
+        storage_used = docker_storage_used(client, container, attrs)
 
         containers.append(
             {

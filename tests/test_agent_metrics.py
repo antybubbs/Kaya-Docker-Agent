@@ -34,9 +34,19 @@ class FakeContainer:
 
 
 class FakeAPI:
-    def inspect_container(self, container_id, size=False):
+    def _url(self, path, container_id):
+        assert path == "/containers/{0}/json"
         assert container_id == "container-id"
-        assert size is True
+        return "/containers/container-id/json"
+
+    def _get(self, url, params=None):
+        assert url == "/containers/container-id/json"
+        assert params == {"size": "1"}
+        return FakeResponse()
+
+
+class FakeResponse:
+    def json(self):
         return {"SizeRw": 104857600}
 
 
